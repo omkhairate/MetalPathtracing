@@ -16,18 +16,26 @@ class Renderer
  public:
     Renderer(MTL::Device *pDevice);
     ~Renderer();
-    void buildScene();
+    void updateVisibleScene();
     void buildShaders();
     void buildBuffers();
     void buildTextures();
     
     void recalculateViewport();
-    void updateCamera();
+    bool updateCamera();
     
     void updateUniforms();
     
     void draw(MTK::View *pView);
     void drawableSizeWillChange(MTK::View *pView, CGSize size);
+    std::vector<std::pair<simd::float3, float>> _allSpheres;
+
+    
+    struct Chunk {
+        std::vector<std::pair<simd::float4, simd::float4>> spheres; // (transform, material)
+        simd::int3 chunkCoords;
+    };
+
     
  private:
     MTL::Device *_pDevice;

@@ -95,6 +95,17 @@ class Scene
         return bvhNodes.size();
     }
     
+    
+    inline void clearEntities() {
+        entityCount = 0;
+        bvhNodes.clear();
+        primitiveIndices.clear();
+    }
+    
+
+    
+
+    
  private:
     size_t entityCount = 0;
     size_t capacity;

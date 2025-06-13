@@ -40,6 +40,51 @@ inline float randomFloat()
     return (float)bitm_random() / (float)std::numeric_limits<uint32_t>::max();
 }
 
+bool isSphereInFrustum(const simd::float3& position, float radius) {
+    // Vector from camera to sphere center
+    simd::float3 toSphere = position - Camera::position;
+
+    // Distance along the forward direction
+    float forwardDot = simd::dot(toSphere, Camera::forward);
+
+    // Reject spheres behind camera or too far
+    if (forwardDot < -radius || forwardDot > 150.0f + radius) return false;
+
+    // Normalize toSphere for angle calculations
+    simd::float3 toSphereNorm = simd::normalize(toSphere);
+
+    // Calculate right and up vectors of the camera
+    simd::float3 right = simd::normalize(simd::cross(Camera::forward, Camera::up));
+    simd::float3 up = simd::normalize(Camera::up);
+
+    // Convert vertical FOV to radians
+    float vFov = Camera::verticalFov * (M_PI / 180.0f);
+
+    // Calculate horizontal FOV from vertical FOV and aspect ratio
+    float aspectRatio = Camera::screenSize.x / Camera::screenSize.y;
+    float hFov = atan(aspectRatio * tan(vFov * 0.5f));
+
+    // Project direction vector onto camera's right and up axes
+    float horizontalAngle = acos(simd::dot(toSphereNorm, Camera::forward)); // angle from forward
+    float rightDot = simd::dot(toSphereNorm, right);
+    float upDot = simd::dot(toSphereNorm, up);
+
+    // Calculate horizontal and vertical angles relative to forward direction
+    float angleH = atan2(rightDot, simd::dot(toSphereNorm, Camera::forward)); // left/right angle
+    float angleV = atan2(upDot, simd::dot(toSphereNorm, Camera::forward));    // up/down angle
+
+    // Add margin to radius to avoid clipping at edges
+    float margin = radius / forwardDot; // approximate angular margin based on radius and distance
+
+    // Check if sphere is inside horizontal and vertical frustum angles (with margin)
+    bool insideHorizontal = fabs(angleH) <= hFov + margin;
+    bool insideVertical = fabs(angleV) <= vFov * 0.5f + margin;
+
+    return insideHorizontal && insideVertical;
+}
+
+
+
 Renderer::Renderer( MTL::Device* pDevice )
 : _pDevice(pDevice->retain()), _pScene(new Scene(256))
 {
@@ -48,7 +93,7 @@ Renderer::Renderer( MTL::Device* pDevice )
     Camera::reset();
     Camera::screenSize = {1280, 720};
     
-    buildScene();
+    updateVisibleScene();
     buildShaders();
     buildBuffers();
     buildTextures();
@@ -106,92 +151,142 @@ void Renderer::buildShaders()
     pLibrary->release();
 }
 
-void Renderer::buildScene()
+void Renderer::updateVisibleScene()
 {
-    for(size_t i = 0; i < 50; i++)
-    {
-        const float radius = randomFloat()*3 + 0.5;
-        const simd::float3 position = simd::float3{randomFloat()*100-50, radius, randomFloat()*100-50};
-        
-        const simd::float3 albedo = {randomFloat(), randomFloat(), randomFloat()};
-        const simd::float3 emissionColor = {randomFloat(), randomFloat(), randomFloat()};
-        
-        const float materialProbability = randomFloat();
-        const float materialType = materialProbability < 0.3 ? -1 : (materialProbability < 0.8 ? 0 : 1.5);
-        
-        const float emissionPower = 0.0f;//materialType == 0 ? simd::max(randomFloat() * 90 - 60, 0.0f) : 0;
-        
-        _pScene->addEntity({position, radius}, {albedo, materialType, emissionColor, emissionPower});
+    const int sphereCount = 50;
+    std::vector<std::pair<simd::float3, float>> visibleSpheres;
+    
+    if (_allSpheres.empty()) {
+        for (size_t i = 0; i < sphereCount; i++) {
+            const float radius = randomFloat() * 3 + 0.5f;
+            const simd::float3 position = {
+                randomFloat() * 100 - 50,
+                radius,
+                randomFloat() * 100 - 50
+            };
+            _allSpheres.push_back({position, radius});
+        }
     }
     
+    for (auto& [position, radius] : _allSpheres) {
+        if (isSphereInFrustum(position, radius)) {
+            visibleSpheres.push_back({position, radius});
+        }
+    }
+    
+    _pScene->clearEntities();
+
+
+    for (auto& [position, radius] : visibleSpheres) {
+        const simd::float3 albedo = { randomFloat(), randomFloat(), randomFloat() };
+        const simd::float3 emissionColor = { randomFloat(), randomFloat(), randomFloat() };
+        const float materialType = (randomFloat() < 0.3f) ? -1 : (randomFloat() < 0.8f ? 0 : 1.5f);
+        const float emissionPower = 0.0f;
+
+        _pScene->addEntity({position, radius}, {albedo, materialType, emissionColor, emissionPower});
+    }
+
+    // Add fixed ground and light-emitting spheres
     _pScene->addEntity({{0, -10000, 0}, 10000}, {{0.99, 0.65, 0.01}, 0, {0}, 0});
     _pScene->addEntity({{0, 100, -100}, 40}, {{0.99, 0.65, 0.01}, 0, {0.7, 0.3, 0.1}, 2});
     _pScene->addEntity({{0, 20, -100}, 10}, {{0.99, 0.65, 0.01}, 0, {0.5, 0.8, 0.5}, 20});
-    
+
     _pScene->buildBVH();
-    
-    printf("Renderer: BVH Node count after build: %zu\n", _pScene->getBVHNodeCount());
-    
-    simd::float4* bvhBufferData = _pScene->createBVHBuffer();
+    printf("BVH node count: %zu\n", _pScene->getBVHNodeCount());
+
+    simd::float4* bvhData = _pScene->createBVHBuffer();
+    if (_pBVHBuffer) _pBVHBuffer->release();
     _pBVHBuffer = _pDevice->newBuffer(
-        bvhBufferData,
+        bvhData,
         sizeof(simd::float4) * _pScene->getBVHNodeCount() * 2,
         MTL::ResourceStorageModeManaged
     );
-    
     _pBVHBuffer->didModifyRange(NS::Range::Make(0, _pBVHBuffer->length()));
-    
-    
-    
+
+    buildBuffers(); // Rebuild sphere & material buffers
 }
+
 
 
 void Renderer::recalculateViewport()
 {
-    UniformsData &u = *((UniformsData*)_pUniformsBuffer->contents());
-    
-    const float radianFov = Camera::verticalFov * (M_PI / 180);
-    
-    const auto h = simd::tan(radianFov/2);
-    
-    const auto viewportHeight = 2 * h * Camera::focalLength;
-    const auto viewportWidth = viewportHeight * (Camera::screenSize.x / Camera::screenSize.y);
-    
-    u.cameraPosition = Camera::position;
-    
-    u.screenSize = Camera::screenSize;
+    float aspectRatio = Camera::screenSize.x / Camera::screenSize.y;
 
-    u.viewportU = viewportWidth * simd::normalize(simd::cross(Camera::forward, Camera::up));
-    u.viewportV = viewportHeight * -Camera::up;
-    
-    u.firstPixelPosition = Camera::position + Camera::forward*Camera::focalLength - u.viewportU/2 - u.viewportV/2;
-    
-    u.frameCount = 0;
+    float fovRad = Camera::verticalFov * (M_PI / 180.0f);
+    float halfHeight = tanf(fovRad * 0.5f);
+    float halfWidth = aspectRatio * halfHeight;
+
+    simd::float3 w = simd::normalize(-Camera::forward); // camera backward
+    simd::float3 u = simd::normalize(simd::cross(Camera::up, w)); // right vector
+    simd::float3 v = simd::cross(w, u); // up vector
+
+    simd::float3 viewportU = u * (2.0f * halfWidth);
+    simd::float3 viewportV = v * (2.0f * halfHeight);
+
+    // Flip viewportV to fix upside-down
+    viewportV = -viewportV;
+
+    // Adjust firstPixelPosition accordingly (assuming top-left corner)
+    simd::float3 firstPixelPosition = Camera::position - w - (viewportU * 0.5f) - (viewportV * 0.5f);
+
+    UniformsData* uData = (UniformsData*)_pUniformsBuffer->contents();
+    uData->cameraPosition = Camera::position;
+    uData->viewportU = viewportU;
+    uData->viewportV = viewportV;
+    uData->firstPixelPosition = firstPixelPosition;
+    uData->screenSize = Camera::screenSize;
+
+    _pUniformsBuffer->didModifyRange(NS::Range::Make(0, sizeof(UniformsData)));
 }
+
 
 
 void Renderer::buildBuffers()
 {
+    // Get the current list of visible spheres (all spheres if no culling)
     const size_t sphereCount = _pScene->getEntityCount();
-    
-    simd::float4 *sphereTransforms = _pScene->createTransformsBuffer();
-    simd::float4 *sphereMaterials = _pScene->createMaterialsBuffer();
-    
-    const size_t spheresDataSize = sphereCount * sizeof( simd::float4 );
-    const size_t sphereMaterialsDataSize = 2 * sphereCount * sizeof( simd::float4 );
-    const size_t uniformsDataSize = sizeof( UniformsData );
+    if (sphereCount == 0) {
+        
+        if (_pSphereBuffer) { _pSphereBuffer->release(); _pSphereBuffer = nullptr; }
+        if (_pSphereMaterialBuffer) { _pSphereMaterialBuffer->release(); _pSphereMaterialBuffer = nullptr; }
+        if (_pUniformsBuffer) { _pUniformsBuffer->release(); _pUniformsBuffer = nullptr; }
+        return;
+    }
 
-    _pSphereBuffer = _pDevice->newBuffer( spheresDataSize, MTL::ResourceStorageModeManaged );;
-    _pSphereMaterialBuffer = _pDevice->newBuffer( sphereMaterialsDataSize, MTL::ResourceStorageModeManaged );
-    _pUniformsBuffer = _pDevice->newBuffer( uniformsDataSize, MTL::ResourceStorageModeManaged );
+    // Get fresh data arrays sized exactly for sphereCount
+    simd::float4* sphereTransforms = _pScene->createTransformsBuffer();
+    simd::float4* sphereMaterials = _pScene->createMaterialsBuffer();
 
-    memcpy(_pSphereBuffer->contents(), sphereTransforms, spheresDataSize );
-    memcpy(_pSphereMaterialBuffer->contents(), sphereMaterials, sphereMaterialsDataSize );
+    // Defensive checks
+    assert(sphereTransforms != nullptr && "Transforms buffer is null");
+    assert(sphereMaterials != nullptr && "Materials buffer is null");
 
-    _pSphereBuffer->didModifyRange(NS::Range::Make(0, _pSphereBuffer->length() ) );
-    _pSphereMaterialBuffer->didModifyRange(NS::Range::Make(0, _pSphereMaterialBuffer->length() ) );
-    _pUniformsBuffer->didModifyRange(NS::Range::Make(0, _pUniformsBuffer->length() ) );
+    // Calculate data sizes carefully — 2 float4's per sphere for materials
+    const size_t spheresDataSize = sphereCount * sizeof(simd::float4);
+    const size_t sphereMaterialsDataSize = 2 * sphereCount * sizeof(simd::float4);
+    const size_t uniformsDataSize = sizeof(UniformsData);
+
+    // Release old buffers safely
+    if (_pSphereBuffer) { _pSphereBuffer->release(); _pSphereBuffer = nullptr; }
+    if (_pSphereMaterialBuffer) { _pSphereMaterialBuffer->release(); _pSphereMaterialBuffer = nullptr; }
+    if (_pUniformsBuffer) { _pUniformsBuffer->release(); _pUniformsBuffer = nullptr; }
+
+    // Create new buffers with exact size
+    _pSphereBuffer = _pDevice->newBuffer(spheresDataSize, MTL::ResourceStorageModeManaged);
+    _pSphereMaterialBuffer = _pDevice->newBuffer(sphereMaterialsDataSize, MTL::ResourceStorageModeManaged);
+    _pUniformsBuffer = _pDevice->newBuffer(uniformsDataSize, MTL::ResourceStorageModeManaged);
+
+    // Copy data to GPU buffers
+    memcpy(_pSphereBuffer->contents(), sphereTransforms, spheresDataSize);
+    memcpy(_pSphereMaterialBuffer->contents(), sphereMaterials, sphereMaterialsDataSize);
+
+    // Tell Metal buffers what range we modified
+    _pSphereBuffer->didModifyRange(NS::Range::Make(0, spheresDataSize));
+    _pSphereMaterialBuffer->didModifyRange(NS::Range::Make(0, sphereMaterialsDataSize));
+    _pUniformsBuffer->didModifyRange(NS::Range::Make(0, uniformsDataSize));
 }
+
+
 
 void Renderer::buildTextures()
 {
@@ -208,35 +303,56 @@ void Renderer::buildTextures()
         _accumulationTargets[i] = _pDevice->newTexture(textureDescriptor);
 }
 
-void Renderer::updateCamera()
+bool Renderer::updateCamera()
 {
     const bool cameraUpdated = Camera::transformWithInputs();
     
     if(cameraUpdated) recalculateViewport();
+    
+    return cameraUpdated;
 }
+
 
 void Renderer::updateUniforms()
 {
     UniformsData &u = *((UniformsData*)_pUniformsBuffer->contents());
     
-    u.frameCount += 1;
-    u.randomSeed = {randomFloat(), randomFloat(), randomFloat()};
+
+    const bool cameraChanged = updateCamera();
+
+    if (cameraChanged)
+    {
+        u.frameCount = 0;  // reset accumulation
+        // clear accumulation buffer if you have one
+        u.randomSeed = {randomFloat(), randomFloat(), randomFloat()};
+    }
+    else
+    {
+        u.frameCount += 1;
+    }
+
+    
     u.sphereCount = _pScene->getEntityCount();
-    
-    updateCamera();
-    
-    _pUniformsBuffer->didModifyRange(NS::Range::Make(0, _pUniformsBuffer->length() ) );
+
+    _pUniformsBuffer->didModifyRange(NS::Range::Make(0, _pUniformsBuffer->length()));
 }
+
 
 void Renderer::draw( MTK::View* pView )
 {
+    static int frameCounter = 0;
+    frameCounter++;
+
+    if (frameCounter % 30 == 0)
+        updateVisibleScene();
+
     {
         updateUniforms();
         MTL::Texture *tmp = _accumulationTargets[0];
         _accumulationTargets[0] = _accumulationTargets[1];
         _accumulationTargets[1] = tmp;
     }
-    
+
     {
         NS::AutoreleasePool *pPool = NS::AutoreleasePool::alloc()->init();
 
@@ -261,8 +377,8 @@ void Renderer::draw( MTK::View* pView )
 
         pPool->release();
     }
-
 }
+
 
 void Renderer::drawableSizeWillChange(MTK::View *pView, CGSize size)
 {

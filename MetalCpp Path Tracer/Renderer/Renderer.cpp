@@ -5,6 +5,7 @@
 #include "InputSystem.h"
 #include "Camera.h"
 #include <cstdio>
+#include "SceneLoader.h"
 
 
 using namespace MetalCppPathTracer;
@@ -153,43 +154,7 @@ void Renderer::buildShaders()
 
 void Renderer::updateVisibleScene()
 {
-    const int sphereCount = 50;
-    std::vector<std::pair<simd::float3, float>> visibleSpheres;
-    
-    if (_allSpheres.empty()) {
-        for (size_t i = 0; i < sphereCount; i++) {
-            const float radius = randomFloat() * 3 + 0.5f;
-            const simd::float3 position = {
-                randomFloat() * 100 - 50,
-                radius,
-                randomFloat() * 100 - 50
-            };
-            _allSpheres.push_back({position, radius});
-        }
-    }
-    
-    for (auto& [position, radius] : _allSpheres) {
-        if (isSphereInFrustum(position, radius)) {
-            visibleSpheres.push_back({position, radius});
-        }
-    }
-    
-    _pScene->clearEntities();
-
-
-    for (auto& [position, radius] : visibleSpheres) {
-        const simd::float3 albedo = { randomFloat(), randomFloat(), randomFloat() };
-        const simd::float3 emissionColor = { randomFloat(), randomFloat(), randomFloat() };
-        const float materialType = (randomFloat() < 0.3f) ? -1 : (randomFloat() < 0.8f ? 0 : 1.5f);
-        const float emissionPower = 0.0f;
-
-        _pScene->addEntity({position, radius}, {albedo, materialType, emissionColor, emissionPower});
-    }
-
-    // Add fixed ground and light-emitting spheres
-    _pScene->addEntity({{0, -10000, 0}, 10000}, {{0.99, 0.65, 0.01}, 0, {0}, 0});
-    _pScene->addEntity({{0, 100, -100}, 40}, {{0.99, 0.65, 0.01}, 0, {0.7, 0.3, 0.1}, 2});
-    _pScene->addEntity({{0, 20, -100}, 10}, {{0.99, 0.65, 0.01}, 0, {0.5, 0.8, 0.5}, 20});
+    SceneLoader::LoadSceneFromXML("/Users/apollo/Downloads/MetalCppPathTracer-main/MetalCpp Path Tracer/scene.xml", _pScene);
 
     _pScene->buildBVH();
     printf("BVH node count: %zu\n", _pScene->getBVHNodeCount());
@@ -203,8 +168,10 @@ void Renderer::updateVisibleScene()
     );
     _pBVHBuffer->didModifyRange(NS::Range::Make(0, _pBVHBuffer->length()));
 
-    buildBuffers(); // Rebuild sphere & material buffers
+    buildBuffers();
 }
+
+
 
 
 
@@ -243,48 +210,45 @@ void Renderer::recalculateViewport()
 
 void Renderer::buildBuffers()
 {
-    // Get the current list of visible spheres (all spheres if no culling)
     const size_t sphereCount = _pScene->getEntityCount();
+    const size_t uniformsDataSize = sizeof(UniformsData);
+
+    // Always release old uniforms buffer
+    if (_pUniformsBuffer) {
+        _pUniformsBuffer->release();
+        _pUniformsBuffer = nullptr;
+    }
+
+    // Always create uniforms buffer
+    _pUniformsBuffer = _pDevice->newBuffer(uniformsDataSize, MTL::ResourceStorageModeManaged);
+    _pUniformsBuffer->didModifyRange(NS::Range::Make(0, uniformsDataSize));
+
     if (sphereCount == 0) {
-        
         if (_pSphereBuffer) { _pSphereBuffer->release(); _pSphereBuffer = nullptr; }
         if (_pSphereMaterialBuffer) { _pSphereMaterialBuffer->release(); _pSphereMaterialBuffer = nullptr; }
-        if (_pUniformsBuffer) { _pUniformsBuffer->release(); _pUniformsBuffer = nullptr; }
         return;
     }
 
-    // Get fresh data arrays sized exactly for sphereCount
+    // Create sphere buffers only if we have entities
     simd::float4* sphereTransforms = _pScene->createTransformsBuffer();
     simd::float4* sphereMaterials = _pScene->createMaterialsBuffer();
 
-    // Defensive checks
-    assert(sphereTransforms != nullptr && "Transforms buffer is null");
-    assert(sphereMaterials != nullptr && "Materials buffer is null");
-
-    // Calculate data sizes carefully — 2 float4's per sphere for materials
     const size_t spheresDataSize = sphereCount * sizeof(simd::float4);
     const size_t sphereMaterialsDataSize = 2 * sphereCount * sizeof(simd::float4);
-    const size_t uniformsDataSize = sizeof(UniformsData);
 
-    // Release old buffers safely
     if (_pSphereBuffer) { _pSphereBuffer->release(); _pSphereBuffer = nullptr; }
     if (_pSphereMaterialBuffer) { _pSphereMaterialBuffer->release(); _pSphereMaterialBuffer = nullptr; }
-    if (_pUniformsBuffer) { _pUniformsBuffer->release(); _pUniformsBuffer = nullptr; }
 
-    // Create new buffers with exact size
     _pSphereBuffer = _pDevice->newBuffer(spheresDataSize, MTL::ResourceStorageModeManaged);
     _pSphereMaterialBuffer = _pDevice->newBuffer(sphereMaterialsDataSize, MTL::ResourceStorageModeManaged);
-    _pUniformsBuffer = _pDevice->newBuffer(uniformsDataSize, MTL::ResourceStorageModeManaged);
 
-    // Copy data to GPU buffers
     memcpy(_pSphereBuffer->contents(), sphereTransforms, spheresDataSize);
     memcpy(_pSphereMaterialBuffer->contents(), sphereMaterials, sphereMaterialsDataSize);
 
-    // Tell Metal buffers what range we modified
     _pSphereBuffer->didModifyRange(NS::Range::Make(0, spheresDataSize));
     _pSphereMaterialBuffer->didModifyRange(NS::Range::Make(0, sphereMaterialsDataSize));
-    _pUniformsBuffer->didModifyRange(NS::Range::Make(0, uniformsDataSize));
 }
+
 
 
 
